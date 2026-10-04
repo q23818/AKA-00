@@ -1,5 +1,24 @@
 __pycache__/
 .idea
 static
+!dora/web-server/static/
 output/
 checkpoints/
+dist/
+.DS_Store
+
+# cpp build artifacts（含 noscreen 变体的独立构建目录/产物）
+cpp/csrc/build/
+cpp/csrc/build-noscreen/
+cpp/csrc/build-cross/
+cpp/csrc/build-cross-noscreen/
+# 开发机单测产物（make -C cpp/csrc test-standby）
+cpp/csrc/build-tests/
+cpp/capp/build/
+cpp/capp/build-noscreen/
+cpp/capp/build-cross/
+cpp/capp/build-cross-noscreen/
+cpp/capp/bin/
+cpp/third_party/
+cpp/dist/
+cpp/dist-noscreen/

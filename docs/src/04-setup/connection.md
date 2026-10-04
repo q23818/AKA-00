@@ -3,7 +3,8 @@
 这部分为机器人的初始化部分，都会在用户拿到设备前实现，如果用户需要自行初始化也可以按照本流程实现。
 
 ## 烧录镜像
-从Releases处下载最新镜像，通过烧入工具将镜像烧录到tf卡中，镜像中会自带一份项目文件。
+
+从[Releases](https://github.com/chenlongos/AKA-00/releases/)下载最新镜像，通过烧入工具将镜像烧录到tf卡中，镜像中会自带一份项目文件。
 
 ## 连接主控
 
@@ -12,85 +13,54 @@
 在win下在终端里输入`ipconfig`，找到一个新的以太网，例如 `10.163.124.100`。
 之后可以使用ssh进行连接，`ssh root@10.163.124.1`
 
-## 连接网络
+## 部署 aka-00-server
 
-启动一次根目录下的`init_ap_web.sh`这会让小车自己成为一个热点，方便个人设备的连接，同时将项目自启动脚本写入系统。
+将 `aka-00-server` 拷贝到控制板，一条命令完成初始化：
 
-## 项目启动
-
-可以选择重启机器人，或者手动启动项目。
 ```shell
-chmod +x init.sh
-./init.sh
+# 1. 拷贝到控制板（-O：板载 sshd 不认新版 SFTP 协议；别放 /tmp，那是内存盘）
+scp -O cpp/dist/aka-00-server root@<robot>:/root/
+
+# 2. 一键初始化（解包 + AP 热点 + DHCP + 开机自启）
+ssh root@<robot> '/root/aka-00-server --init'
 ```
 
-如果没有生成过证书文件，会生成https的证书后运行项目
+`--init` 自动完成：
+- 解包到 `$AKA_HOME`（默认 `/root/AKA-00`）
+- 配置 AP 热点（SSID `chenlong-robot-<数字>`，由 wlan0 的 MAC 推出，开放无密码，
+  channel 6；要加密码就取消 `/etc/hostapd.conf` 里 `wpa=2` 那几行注释）
+- 配置 DHCP（`192.168.4.100`~`192.168.4.200`，网关 `192.168.4.1`）
+- 写入 `S98apstart` / `S99webstart` 自启脚本
+- 立即启动热点
 
-## HTTPS 证书生成
+之后每次开机由 `/etc/init.d/S99webstart` 拉起 `init.sh`（内部自愈循环，capp 崩了自动重启）。
+
+手动更新：
+
+```shell
+scp -O cpp/dist/aka-00-server root@<robot>:/root/
+ssh root@<robot> 'setsid /root/aka-00-server --update >/root/ota.log 2>&1 < /dev/null'
+```
+
+> `--update` 默认**保留**板上的 `config.toml`、`speed_config.json`、`arm_angles.json`、
+> `cert.pem`、`key.pem` 与 demo 卡片/模型；想让包里带的新配置生效，加
+> `AKA_OTA_RESET_CONFIG=1`。结尾是 `exec init.sh`，会把服务挂在当前 ssh 会话上，
+> 所以要 `setsid`（或者升级完 `reboot`）。
+
+## HTTPS 证书生成命令
+
+> 通常**不需要手工执行** —— `init.sh` 启动前会调 `https_init.sh` 自动生成
+> （缺 `cert.pem`/`key.pem` 时），端口默认 443。下面这条只在你想自己换/重置证书时用。
+
 -  无交互生成自签名证书，有效期10年（3650天）
 ```shell
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/C=CN/ST=Beijing/L=Beijing/O=MyOrg/OU=MyDept/CN=localhost"
-```
-
-如果想通过指定 WiFi 的方式连接项目并自启动，可以遵循以下流程。
-
-## 开机自启动
-
-设置为sta模式，[修改方式](https://wiki.sipeed.com/hardware/zh/lichee/RV_Nano/5_peripheral.html#WIFI)
-
-在/etc/init.d 文件中 添加 一个appinit文件，输入
-
-```shell
-#!/bin/sh
-# 程序路径
-APP_PATH="/root/AKA-00"
-# 程序运行用户（一般嵌入式用 root）
-RUN_USER="root"
-
-# 启动函数
-start() {
-    sleep 5
-	chmod +x /root/AKA-00/init.sh
-	/root/AKA-00/init.sh
-}
-
-# 停止函数（可选，便于手动管理）
-stop() {}
-
-# 重启函数（可选）
-restart() {
-    stop
-    sleep 1
-    start
-}
-
-# 脚本参数处理
-case "$1" in
-    start)
-        start
-        ;;
-    stop)
-        stop
-        ;;
-    restart)
-        restart
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart}"
-        exit 1
-        ;;
-esac
-
-exit 0
-```
-
-之后在 /etc/inittab 中加入一行，就可以开机自启动，代码要放在AKA-00下
-
-```
-app::sysinit:/etc/init.d/appinit start
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout key.pem -out cert.pem -days 3650 -nodes \
+    -subj "/C=CN/ST=Beijing/L=Beijing/O=MyOrg/OU=MyDept/CN=localhost"
 ```
 
 ## 网络配置
+
 修改 /etc/wpa_supplicant.conf 文件
 ```shell
 ctrl_interface=/var/run/wpa_supplicant

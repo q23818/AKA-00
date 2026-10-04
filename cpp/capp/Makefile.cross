@@ -1,0 +1,84 @@
+# =============================================================================
+# capp — 交叉编译 Makefile（SG2002 / riscv64 musl 静态）
+#
+# 用法:
+#   make -f Makefile.cross                        # 带屏版本 → bin/aka-capp
+#   make -f Makefile.cross WITH_SCREEN=0          # 不带屏 → bin/aka-capp-noscreen
+#   make -f Makefile.cross CXX=/path/to/riscv64-unknown-linux-musl-g++ \
+#                          JPEG_DIR=/path/to/libjpeg
+#
+# JPEG_DIR 指向 libjpeg 安装前缀（含 include/ 与 lib/）。
+# 默认 third_party/jpeg —— 先跑一次 ../scripts/build-libjpeg.sh 生成
+# （riscv64 musl 交叉编译 libjpeg）；也可以指向自己的交叉 libjpeg。
+# =============================================================================
+
+# 带屏 / 不带屏两个变体（与 csrc、顶层 Makefile 的 screen/noscreen 对齐）
+WITH_SCREEN ?= 1
+ifeq ($(WITH_SCREEN),1)
+SCREEN_SUFFIX :=
+SCREEN_DEF    := -DAKA_WITH_SCREEN=1
+else
+SCREEN_SUFFIX := -noscreen
+SCREEN_DEF    := -DAKA_WITH_SCREEN=0
+endif
+
+# ── TPU 推理（cviruntime）──
+#   WITH_TPU=1（默认）→ 链板子 TPU SDK 的**静态库**，capp 仍是单个静态二进制
+#                        （不用改 init.sh 的 LD_LIBRARY_PATH、不用随包发 .so）
+#   WITH_TPU=0         → 不链（csrc 那边同时切到桩，否则 csrc 会引用未定义的符号）
+# 注意：SDK 只有 libcviruntime.so 的话静态链接会失败，这里用的是 SDK 里的
+# -static.a 版本；真的静态链不过时的退路是改成 -lcviruntime + rpath 指向 libs/。
+WITH_TPU    ?= 1
+TPU_SDK_DIR ?= /home/junbo_dai/cvitek_tpu_sdk
+ifeq ($(WITH_TPU),1)
+TPU_LDFLAGS := -L$(TPU_SDK_DIR)/lib \
+               -Wl,--start-group -lcviruntime-static -lcvikernel-static -lcvimath-static -lz \
+               -Wl,--end-group
+else
+TPU_LDFLAGS :=
+endif
+
+# 注意用 := 覆盖环境变量（orb 登录 shell 常导出 CXX=g++ 之类，会污染交叉编译）
+CXX      := /home/junbo_dai/riscv64-linux-musl-x86_64/bin/riscv64-unknown-linux-musl-g++
+CSRC     := ../csrc
+JPEG_DIR ?= ../third_party/jpeg
+MBEDTLS_DIR ?= ../third_party/mbedtls
+LUA_DIR  ?= ../third_party/lua
+TARGET   := bin/aka-capp$(SCREEN_SUFFIX)
+CSRC_LIB := $(CSRC)/build-cross$(SCREEN_SUFFIX)/libcsrc.a
+
+CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -mcpu=c906fdv -MMD -MP -mabi=lp64d \
+            $(SCREEN_DEF) \
+            -Iinclude -I$(CSRC)/include -I$(JPEG_DIR)/include -I$(MBEDTLS_DIR)/include \
+            -I$(LUA_DIR)/include
+LDFLAGS  := -static -L$(JPEG_DIR)/lib -L$(MBEDTLS_DIR)/lib -L$(LUA_DIR)/lib $(TPU_LDFLAGS)
+
+OBJDIR := build-cross$(SCREEN_SUFFIX)
+SRCS := $(wildcard src/*.cpp src/routes/*.cpp src/services/*.cpp src/http/*.cpp)
+OBJS := $(SRCS:src/%.cpp=$(OBJDIR)/%.o)
+DEPS := $(OBJS:.o=.d)
+-include $(DEPS)
+
+.DEFAULT_GOAL := all
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(OBJDIR):
+	mkdir -p $(OBJDIR) bin
+
+$(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+$(CSRC_LIB):
+	$(MAKE) -f Makefile.cross -C $(CSRC) WITH_SCREEN=$(WITH_SCREEN) WITH_TPU=$(WITH_TPU) \
+	    TPU_SDK_DIR=$(TPU_SDK_DIR)
+
+$(TARGET): $(OBJS) $(CSRC_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(CSRC_LIB) \
+	    $(LDFLAGS) -ljpeg -llua -lmbedtls -lmbedx509 -lmbedcrypto -lm -lpthread
+	@echo "  ✓ aka-capp$(SCREEN_SUFFIX) (riscv64 static$(if $(SCREEN_SUFFIX), 不带屏, 带屏)) built"
+
+clean:
+	rm -rf build-cross build-cross-noscreen bin

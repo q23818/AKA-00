@@ -16,17 +16,32 @@
 - [WiFi 连接配置](./04-setup/wifi-config.md)
 - [项目本地启动](./04-setup/software.md)
 - [初始化配置](./04-setup/connection.md)
+- [镜像烧录](./04-setup/image-burn.md)
 
 ## 使用
 
 - [Web 界面](./05-usage/web-ui.md)
+- [WebSocket 控制接口](./05-usage/websocket.md)
 - [API 文档](./05-usage/api.md)
+- [检测 · 识别 · Demo 运行 API](./05-usage/vision-demo.md)
+- [底盘 · 电机控制 API](./05-usage/motor-control.md)
+- [距离标定](./05-usage/dist-calibration.md)
 
 ## 开发
 
 - [开发板使用](./06-development/dev-board.md)
 - [代码结构](./06-development/structure.md)
 - [调试方法](./06-development/debug.md)
+- [镜像的制作](./06-development/image_creation.md)
+
+## 测试
+
+- [测试概述与策略](./08-testing/测试概述与策略.md)
+- [硬件测试](./08-testing/硬件测试.md)
+- [极限工况测试](./08-testing/极限工况测试.md)
+- [交互测试](./08-testing/交互测试.md)
+- [系统集成测试](./08-testing/系统集成测试.md)
+- [缺陷管理与测试报告](./08-testing/缺陷管理与测试报告.md)
 
 ## 其他
 

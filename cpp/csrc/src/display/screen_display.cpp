@@ -1,0 +1,477 @@
+// csrc/screen_display.cpp — 摄像头 → /dev/fb0 实时显示
+//
+// 逻辑移植自板上验证过的 tests/demo_camera.c（脏行检测、方向修正、待机图）。
+// RGB→RGB565 的查表旋转/缩放在 screen_convert.cpp；
+// 非 Linux（开发机）与不带屏版本（AKA_WITH_SCREEN=0）的桩都在本文件的 #else 分支。
+
+#include "csrc/screen_display.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include "csrc/camera.hpp"
+#include "csrc/log.hpp"
+
+#if AKA_WITH_SCREEN
+
+#if defined(__linux__)
+#include <cerrno>
+#include <cstdio>
+#include <fcntl.h>
+#include <linux/fb.h>     // struct fb_var_screeninfo（FBIOGET_VSCREENINFO 必须用真结构体！）
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+namespace {
+
+// 脏行比较的容差掩码：忽略 RGB565 每通道最低 1 个 bit。
+// 实况视频帧间有传感器噪声（JPEG 量化还会放大），精确比较会把静止画面也判成
+// "全行都变"（板上实测 240/240 行全脏）；掩掉最低 1 bit 后静态行才真正不重写。
+// 实测下来只有一个可用值（1），所以做成常量而不是配置项。
+constexpr uint16_t kDirtyMask = 0xF7DE;
+
+// 待机图解码降采样上限宽：start_img.jpg 是 480x320（与面板同比例），按 480 解码
+// 旋转后正好 1:1 铺满 320x480，不再需要放大。原本是配置项 standby_decode_w，
+// 但只有这一个值有意义，所以和 kDirtyMask 一样做成常量。
+constexpr int kStandbyDecodeMaxW = 480;
+
+/// 开启显示引擎（demo2.c 要求 state=1 才显示；init.sh 也会做一次）
+void enable_display_engine() {
+    if (FILE* s = fopen("/sys/class/graphics/fb0/state", "w")) {
+        fputs("1", s);
+        fclose(s);
+    }
+    if (FILE* b = fopen("/sys/class/graphics/fb0/blank", "w")) {
+        fputs("0", b);
+        fclose(b);
+    }
+}
+
+}  // namespace
+#endif  // __linux__
+
+namespace csrc {
+
+ScreenDisplay::~ScreenDisplay() { stop(); }
+
+/// 待机图转换：来源 RGB8 → 目标 RGB565，几何与 convert() 完全一致
+/// （90° 顺时针旋转 + cover 缩放居中裁切 + orient 位0=水平翻/位1=垂直翻），
+/// 差别只在取样方式：这里对每个目标像素取源图一小块做**盒式平均**。
+
+#if defined(__linux__)
+
+bool ScreenDisplay::open_fb() {
+    // O_CLOEXEC：同上，framebuffer fd 也不该被子进程继承
+    fb_fd_ = ::open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (fb_fd_ < 0) {
+        CAM_INFO("[display] no /dev/fb0 (%s) — screen disabled", std::strerror(errno));
+        return false;
+    }
+    // FBIOGET_VSCREENINFO：内核会写入完整 struct fb_var_screeninfo（160 字节），
+    // 用真结构体接收。曾用 28 字节的手写小结构体 → 内核越界写 132 字节踩栈，
+    // 表现为日志串被改坏 + 随后段错误（板上实测）。
+    struct fb_var_screeninfo vi;
+    std::memset(&vi, 0, sizeof vi);
+    if (::ioctl(fb_fd_, FBIOGET_VSCREENINFO, &vi) == 0 &&
+        vi.xres > 0 && vi.yres > 0 && vi.bits_per_pixel > 0) {
+        fb_w_ = (int)vi.xres;
+        fb_h_ = (int)vi.yres;
+        // 行步长：部分驱动有虚拟宽（xres_virtual > xres），此时行间隔按虚拟宽算，
+        // 否则子区域写屏会错位/越界。缓冲大小按虚拟区算，保证 mmap 覆盖到。
+        int stride = vi.xres_virtual > vi.xres ? (int)vi.xres_virtual : (int)vi.xres;
+        int vrows = vi.yres_virtual > vi.yres ? (int)vi.yres_virtual : (int)vi.yres;
+        fb_stride_ = stride;
+        fb_words_ = (size_t)stride * vrows;
+        fb_bytes_ = fb_words_ * (vi.bits_per_pixel / 8);
+    } else {
+        CAM_WARN("[display] FBIOGET_VSCREENINFO failed, assuming 320x480@16bpp");
+        fb_w_ = 320;
+        fb_h_ = 480;
+        fb_stride_ = fb_w_;
+        fb_words_ = (size_t)fb_w_ * fb_h_;
+        fb_bytes_ = fb_words_ * 2;
+    }
+    void* p = ::mmap(nullptr, fb_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd_, 0);
+    if (p == MAP_FAILED) {
+        CAM_ERROR("[display] mmap /dev/fb0 failed: %s", std::strerror(errno));
+        ::close(fb_fd_);
+        fb_fd_ = -1;
+        return false;
+    }
+    fb_ = (uint16_t*)p;
+    CAM_INFO("[display] fb0 %dx%d mapped (%zu bytes)", fb_w_, fb_h_, fb_bytes_);
+    return true;
+}
+
+void ScreenDisplay::close_fb() {
+    if (fb_) {
+        ::munmap(fb_, fb_bytes_);
+        fb_ = nullptr;
+    }
+    if (fb_fd_ >= 0) {
+        ::close(fb_fd_);
+        fb_fd_ = -1;
+    }
+}
+
+bool ScreenDisplay::start(const DisplayConfig& cfg) {
+    if (running_) return true;
+    cfg_ = cfg;
+
+    // 归一化参数
+    if (cfg_.scale < 1) cfg_.scale = 1;
+    if (cfg_.scale > 4) cfg_.scale = 4;
+    if (cfg_.orient < 0) cfg_.orient = 0;
+    if (cfg_.orient > 3) cfg_.orient = 3;
+    if (cfg_.fps < 1) cfg_.fps = 1;
+    if (cfg_.fps > 60) cfg_.fps = 60;
+    if (cfg_.decode_max_w < 0) cfg_.decode_max_w = 0;
+
+    enable_display_engine();
+    if (!open_fb()) return false;
+
+    out_w_ = fb_w_ / cfg_.scale;
+    out_h_ = fb_h_ / cfg_.scale;
+    if (out_w_ < 8) out_w_ = 8;
+    if (out_h_ < 8) out_h_ = 8;
+
+    blit_dst_ = fb_ + (size_t)((fb_h_ - out_h_) / 2) * fb_stride_ + (fb_w_ - out_w_) / 2;
+    // 开摄像头时清一次屏：上一刻屏上可能是整屏待机图，而实时画面只重绘中间区域，
+    // 不清会把待机图的四边留在屏上。一次性 307KB 写屏（20MHz ≈ 150ms），可忽略。
+    clear();
+    buf_.assign((size_t)out_w_ * out_h_, 0);
+    // 首帧强制全量上屏：prev 全 0xFF 与任何真实画面都不等
+    prev_.assign((size_t)out_w_ * out_h_, 0xFFFF);
+    sy_map_.assign((size_t)out_w_, 0);
+    sx_map_.assign((size_t)out_h_, 0);
+
+    {
+        std::lock_guard<std::mutex> lk(st_mu_);
+        st_ = Stats{};
+        st_.out_w = out_w_;
+        st_.out_h = out_h_;
+        st_.total_rows = out_h_;
+        st_.fb_w = fb_w_;
+        st_.fb_h = fb_h_;
+    }
+
+    running_ = true;
+    thread_ = new std::thread([this] { loop(); });
+    CAM_INFO("[display] ▶ %dx%d region (1/%d screen), orient=%d, fps<=%d",
+             out_w_, out_h_, cfg_.scale, cfg_.orient, cfg_.fps);
+    return true;
+}
+
+void ScreenDisplay::stop() {
+    if (thread_) {
+        running_ = false;
+        thread_->join();
+        delete thread_;
+        thread_ = nullptr;
+    }
+    // 摄像头关闭 → 屏上不留最后一帧静止画面（否则看起来像还在采集）：
+    // 配了待机图就显示待机图（熄屏画面），没配/读不出来才退化为清黑。
+    if (fb_) {
+        if (!show_standby()) {
+            clear();
+            CAM_INFO("[display] 清屏（摄像头已关）");
+        }
+    }
+    close_fb();
+    blit_dst_ = nullptr;
+    CAM_INFO("[display] ⏸  stopped");
+}
+
+void ScreenDisplay::clear() {
+    if (!fb_) return;
+    for (size_t i = 0; i < fb_words_; i++) fb_[i] = 0;
+}
+
+bool ScreenDisplay::clear_screen_once() {
+    ScreenDisplay tmp;
+    if (!tmp.open_fb()) return false;
+    tmp.clear();
+    tmp.close_fb();
+    return true;
+}
+
+/// RGB8 → RGB565：旋转 90°（顺时针）+ cover 缩放居中裁切到显示区。
+///
+
+void ScreenDisplay::blit_dirty(int& dirty_rows) {
+    dirty_rows = 0;
+    const uint16_t mask = kDirtyMask;
+    for (int r = 0; r < out_h_; ++r) {
+        const uint16_t* cur = buf_.data() + (size_t)r * out_w_;
+        uint16_t* pv = prev_.data() + (size_t)r * out_w_;
+        bool changed = false;
+        for (int i = 0; i < out_w_; ++i) {
+            if (((cur[i] ^ pv[i]) & mask) != 0) { changed = true; break; }
+        }
+        if (!changed) continue;
+        std::memcpy(blit_dst_ + (size_t)r * fb_stride_, cur, (size_t)out_w_ * sizeof(uint16_t));
+        std::memcpy(pv, cur, (size_t)out_w_ * sizeof(uint16_t));
+        dirty_rows++;
+    }
+}
+
+void ScreenDisplay::loop() {
+    Camera& cam = Camera::get_instance();
+    // 帧率随"浏览器是否在看流"切换：有人看流时降帧（单核 SoC 上显示+取流会饱和）
+    auto cur_interval = [&]() -> std::chrono::milliseconds {
+        int f = streaming_ ? cfg_.fps_streaming : cfg_.fps;
+        if (f <= 0) return std::chrono::milliseconds(0);   // 0 = 暂停显示
+        return std::chrono::milliseconds(1000 / f);
+    };
+    auto last_push = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    uint64_t last_ts = 0;
+
+    // 1Hz 统计窗口
+    auto win_t0 = std::chrono::steady_clock::now();
+    int win_frames = 0, win_rows = 0;
+    long long win_dec = 0, win_conv = 0, win_blit = 0;
+
+    while (running_) {
+        const auto interval = cur_interval();
+        if (interval.count() == 0) {          // 暂停（浏览器在看流且配了 fps_streaming=0）
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            last_push = std::chrono::steady_clock::now();
+            continue;
+        }
+
+        // 帧率上限：到点才处理（避免抢占 Web 服务/浏览器流的 CPU）。
+        // 睡眠按"距下次该处理还有多久"来定（上限 20ms），而不是死板 2ms ——
+        // 低帧率时不再每秒 500 次空唤醒。
+        auto now = std::chrono::steady_clock::now();
+        auto wait = interval - (now - last_push);
+        if (wait > std::chrono::milliseconds(0)) {
+            auto nap = wait > std::chrono::milliseconds(20) ? std::chrono::milliseconds(20) : wait;
+            std::this_thread::sleep_for(nap);
+            continue;
+        }
+
+        // 先做轻量时间戳判断：没有新帧就完全不拷贝、不解码（否则每 2ms 白拷一次帧）。
+        //
+        // **这里必须睡一下再 continue**：上面的"按距下次该处理还有多久"在"相机出帧比显示
+        // 间隔慢"时恒为 0（last_push 只在真处理了帧时才更新），裸 continue 就变成
+        // 100% 占满单核的死循环 —— 板上实测：显示线程烧掉 90 秒 CPU、load 4.8，
+        // 连脚本线程都被拖到不响应 /api/demo/stop（表现为"脚本卡在 detect 里出不来"）。
+        uint64_t ts = cam.latest_ts();
+        if (ts == 0 || ts == last_ts) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            continue;
+        }
+
+        // 复用 Camera 单例 + 共享解码缓存：同一帧屏幕与浏览器只解码一次。
+        // 命中缓存时 dec 接近 0（说明浏览器已经解过这一帧）。
+        auto t0 = std::chrono::steady_clock::now();
+        Camera::RgbFrame rgb;
+        if (!cam.latest_rgb(cfg_.decode_max_w, rgb) || rgb.data.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));   // 同上：别空转
+            continue;
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        if (rgb.ts_ms == last_ts) continue;   // 竞态兜底：与上面判断之间换了帧也无妨
+        last_ts = rgb.ts_ms;
+
+        convert(rgb.data.data(), rgb.w, rgb.h);
+        auto t2 = std::chrono::steady_clock::now();
+
+        int dirty = 0;
+        if (blit_dst_) blit_dirty(dirty);
+        auto t3 = std::chrono::steady_clock::now();
+
+        // 首帧日志：确认显示链路真的通了（解码尺寸 → 显示区 → 实际写屏行数）
+        static bool first_frame_logged = false;
+        if (!first_frame_logged) {
+            first_frame_logged = true;
+            CAM_INFO("[display] 首帧已上屏 %dx%d → %dx%d 区, %d/%d 行 (dec %lldms conv %lldms blit %lldms)",
+                     rgb.w, rgb.h, out_w_, out_h_, dirty, out_h_,
+                     (long long)(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000),
+                     (long long)(std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000),
+                     (long long)(std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count() / 1000));
+        }
+
+        win_frames++;
+        win_rows += dirty;
+        win_dec += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        win_conv += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        win_blit += std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+        last_push = t3;
+
+        // 1Hz 上报（debug 级：默认 info 不刷屏）
+        auto el = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - win_t0).count();
+        if (el >= 1000) {
+            int n = win_frames > 0 ? win_frames : 1;
+            CAM_DEBUG("[display] %d fps%s | dec %lldms | conv %lldms | blit %lldms (%d/%d rows)",
+                      win_frames, streaming_ ? "[浏览器在看流→降帧]" : "",
+                      win_dec / n / 1000, win_conv / n / 1000,
+                      win_blit / n / 1000, win_rows / n, out_h_);
+            std::lock_guard<std::mutex> lk(st_mu_);
+            st_.fps = win_frames;
+            st_.dec_ms = (int)(win_dec / n / 1000);
+            st_.conv_ms = (int)(win_conv / n / 1000);
+            st_.blit_ms = (int)(win_blit / n / 1000);
+            st_.rows = win_rows / n;
+            st_.frames += (uint64_t)win_frames;
+            win_frames = win_rows = 0;
+            win_dec = win_conv = win_blit = 0;
+            win_t0 = t3;
+        }
+    }
+}
+
+/// 把 RGB565 缓冲按行写进 framebuffer：dst = fb_ + y0*stride + x0，越界自动裁剪。
+void ScreenDisplay::blit_buffer(const uint16_t* src, int w, int h, int x0, int y0) {
+    if (!fb_ || !src || w <= 0 || h <= 0) return;
+    for (int y = 0; y < h; y++) {
+        const int dy = y0 + y;
+        if (dy < 0 || dy >= fb_h_) continue;
+        int sx = 0, dx = x0, cw = w;
+        if (dx < 0) { sx = -dx; cw -= sx; dx = 0; }
+        if (dx + cw > fb_w_) cw = fb_w_ - dx;
+        if (cw <= 0) continue;
+        std::memcpy(fb_ + (size_t)dy * fb_stride_ + dx, src + (size_t)y * w + sx,
+                    (size_t)cw * sizeof(uint16_t));
+    }
+}
+
+/// 待机图路径解析：相对路径按 $AKA_HOME 解析（打包后 = 应用根下的 start_img.jpg）
+static std::string resolve_standby_path(const std::string& path) {
+    if (path.empty() || path[0] == '/') return path;
+    if (const char* home = std::getenv("AKA_HOME")) return std::string(home) + "/" + path;
+    return path;
+}
+
+bool ScreenDisplay::show_standby(const std::string& image_path) {
+    if (!fb_) return false;
+    const std::string path =
+        resolve_standby_path(image_path.empty() ? cfg_.standby_image : image_path);
+    if (path.empty()) return false;
+
+    // 读文件 → libjpeg 解码（按 kStandbyDecodeMaxW 走 1/N 降采样档）
+    std::vector<uint8_t> jpg;
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {
+        std::fseek(f, 0, SEEK_END);
+        const long len = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (len > 0) {
+            jpg.resize((size_t)len);
+            if (std::fread(jpg.data(), 1, jpg.size(), f) != jpg.size()) jpg.clear();
+        }
+        std::fclose(f);
+    } else {
+        CAM_INFO("[standby] 待机图打不开: %s（保持黑屏）", path.c_str());
+        return false;
+    }
+    if (jpg.empty()) {
+        CAM_INFO("[standby] 待机图内容为空: %s", path.c_str());
+        return false;
+    }
+
+    int w = 0, h = 0;
+    std::vector<uint8_t> rgb;
+    if (!Camera::jpeg_to_rgb(jpg.data(), jpg.size(), w, h, rgb, kStandbyDecodeMaxW)) {
+        CAM_INFO("[standby] 待机图解码失败: %s（保持黑屏）", path.c_str());
+        return false;
+    }
+
+    // 待机图总是铺满整屏：它是"熄屏画面"，不该取决于摄像头显示区的 scale
+    const int out_w = fb_w_, out_h = fb_h_;
+    std::vector<uint16_t> buf((size_t)out_w * out_h);
+    convert_box(rgb.data(), w, h, out_w, out_h, cfg_.orient, buf.data());
+    blit_buffer(buf.data(), out_w, out_h, 0, 0);
+    CAM_INFO("[standby] 待机图已上屏: %s (%dx%d → %dx%d 整屏, orient=%d)", path.c_str(), w, h,
+             out_w, out_h, cfg_.orient);
+    return true;
+}
+
+bool ScreenDisplay::show_standby_once(const std::string& image_path, const DisplayConfig& cfg) {
+    ScreenDisplay tmp;
+    tmp.cfg_ = cfg;
+    if (!tmp.open_fb()) return false;
+    const bool ok = tmp.show_standby(image_path);
+    tmp.close_fb();
+    return ok;
+}
+
+ScreenDisplay::Stats ScreenDisplay::stats() const {
+    std::lock_guard<std::mutex> lk(st_mu_);
+    return st_;
+}
+
+#else  // !__linux__ —— 开发机 stub
+
+bool ScreenDisplay::open_fb() { return false; }
+
+void ScreenDisplay::close_fb() {}
+
+bool ScreenDisplay::start(const DisplayConfig& cfg) {
+    cfg_ = cfg;
+    CAM_WARN("[display] screen unavailable on non-Linux build");
+    return false;
+}
+
+void ScreenDisplay::stop() {}
+
+void ScreenDisplay::clear() {}
+
+bool ScreenDisplay::clear_screen_once() { return false; }
+
+bool ScreenDisplay::show_standby(const std::string&) { return false; }
+
+bool ScreenDisplay::show_standby_once(const std::string&, const DisplayConfig&) { return false; }
+
+void ScreenDisplay::blit_buffer(const uint16_t*, int, int, int, int) {}
+
+void ScreenDisplay::blit_dirty(int& rows) { rows = 0; }
+
+void ScreenDisplay::loop() {}
+
+ScreenDisplay::Stats ScreenDisplay::stats() const { return st_; }
+
+#endif  // __linux__
+
+}  // namespace csrc
+
+#else  // !AKA_WITH_SCREEN —— 不带屏版本：整个显示栈编译期裁掉
+
+namespace csrc {
+
+ScreenDisplay::~ScreenDisplay() {}
+
+bool ScreenDisplay::open_fb() { return false; }
+
+void ScreenDisplay::close_fb() {}
+
+bool ScreenDisplay::start(const DisplayConfig& cfg) {
+    cfg_ = cfg;
+    CAM_INFO("[display] 本版本未包含屏显示（AKA_WITH_SCREEN=0）");
+    return false;
+}
+
+void ScreenDisplay::stop() {}
+
+void ScreenDisplay::clear() {}
+
+bool ScreenDisplay::clear_screen_once() { return false; }
+
+bool ScreenDisplay::show_standby(const std::string&) { return false; }
+
+bool ScreenDisplay::show_standby_once(const std::string&, const DisplayConfig&) { return false; }
+
+void ScreenDisplay::blit_buffer(const uint16_t*, int, int, int, int) {}
+
+void ScreenDisplay::blit_dirty(int& rows) { rows = 0; }
+
+void ScreenDisplay::loop() {}
+
+ScreenDisplay::Stats ScreenDisplay::stats() const { return st_; }
+
+}  // namespace csrc
+
+#endif  // AKA_WITH_SCREEN

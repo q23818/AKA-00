@@ -1,34 +1,37 @@
 import threading
+import time
 
 from src.arm_control.interfaces import create_gripper
 from src.base_control.interfaces import create_motor_pair
-from src.state import MotorStateTracker
+from src.state import get_state_collector
+
+_WHEEL_CIRCUMFERENCE_M = 3.1415926535 * 0.062  # 轮径 62mm
 
 
 class ControlService:
     def __init__(self, config):
-        self._state_tracker = MotorStateTracker.get_instance()
+        self._config = config
+        self._arm_driver = config.arm_driver
         self._duration_timer: threading.Timer | None = None
         self._duration_timer_lock = threading.Lock()
-        self._motor_pair = create_motor_pair(
-            left_chip=config.base_left_chip,
-            left_ch1=config.base_left_ch1,
-            left_ch2=config.base_left_ch2,
-            right_chip=config.base_right_chip,
-            right_ch1=config.base_right_ch1,
-            right_ch2=config.base_right_ch2,
-            chip_type=config.base_chip_type,
-        )
+        self._arm_lock = threading.Lock()
+        self._motor_pair = self._create_motor_pair()
         self._gripper = create_gripper(
             driver=config.arm_driver,
             port=config.arm_port,
             baudrate=config.arm_baudrate,
         )
 
-    def get_motor_status(self, timestamp: int) -> dict[str, int]:
-        return self._state_tracker.get_status_at(timestamp)
+    def _create_motor_pair(self):
+        motor_pair = create_motor_pair(
+            port=self._config.base_port,
+            backend=self._config.base_driver,
+        )
+        get_state_collector().set_motor_pair(motor_pair)
+        return motor_pair
 
     def execute_action(self, action: str, speed: int = 50, milliseconds: float = 0) -> dict:
+        # speed: 电机百分比 (1~100)，默认 50
         self._cancel_pending_stop()
         if not (self._apply_base_action(action, speed) or self._apply_arm_action(action)):
             raise ValueError(f"unsupported action: {action}")
@@ -38,10 +41,6 @@ class ControlService:
             return {"status": "success", "message": f"{action} scheduled for {milliseconds}ms"}
 
         return {"status": "success", "action": action}
-
-    def set_motor_speed(self, left: int, right: int) -> dict[str, int | str]:
-        self._motor_pair.set_speed(left, right)
-        return {"status": "success", "left": left, "right": right}
 
     def run_motor(self, left: int, right: int, duration: float = 0) -> dict[str, int | str]:
         """设置电机速度，可选持续时间
@@ -53,16 +52,100 @@ class ControlService:
         """
         self._cancel_pending_stop()
         self._motor_pair.set_speed(left, right)
+        get_state_collector().set_target_speed(left, right)
         if duration > 0:
             self._schedule_stop(duration)
             return {"status": "success", "left": left, "right": right, "duration": duration, "mode": "scheduled"}
         return {"status": "success", "left": left, "right": right}
+
+    def move_distance(self, direction: str, value: float, speed: int) -> dict:
+        """ESP32 MCU 内部执行距离/转向控制（闭环 PID）。
+
+        协议 CMD_MOVE_DISTANCE (0x23) 载荷: dir(1) speed(1) target(4B 大端)
+          dir=0 前进 / dir=1 后退：value = 距离 (mm)
+          dir=2 左转 / dir=3 右转（原地）：value = 角度 (°)
+        固件内部用轮径 62mm、轴距 160mm、PPR 4680 自行换算成编码器计数，
+        因此这里直接发送 mm / 度，不再做任何换算（否则会被固件二次换算）。
+        """
+        import struct
+        speed = min(100, max(1, abs(speed)))
+        dir_map = {"forward": 0, "backward": 1, "left": 2, "right": 3}
+
+        if direction not in dir_map:
+            raise ValueError(f"unknown direction: {direction}")
+
+        d = dir_map[direction]
+        if d in (0, 1):
+            target = int(round(value))       # 直行：mm
+            unit = "mm"
+        else:
+            target = int(round(value * 10))  # 转向：0.1°（如 90° → 900）
+            unit = "deg"
+
+        if target <= 0:
+            return {"status": "error", "message": "target must be positive"}
+
+        try:
+            payload = struct.pack(">BBi", d, speed, target)
+            self._motor_pair._send_cmd_noresp(0x23, payload)
+        except Exception:
+            return {"status": "error", "message": "CMD_MOVE_DISTANCE failed"}
+
+        return {"status": "started", "mode": "esp32", "target": value, "unit": unit}
 
     def send_raw_command(self, cmd: str) -> dict[str, str]:
         raw_sender = getattr(getattr(self._gripper, "_zp10s", None), "_send_raw_cmd", None)
         if cmd and raw_sender is not None:
             raw_sender(cmd)
         return {"status": "success", "cmd": cmd}
+
+    def update_arm_angles(self, driver: str, angles: dict[str, int]) -> dict[str, object]:
+        if driver != self._arm_driver:
+            raise ValueError(f"driver mismatch: expected {self._arm_driver}, got {driver}")
+        updater = getattr(self._gripper, "update_angles", None)
+        if updater is not None:
+            updater(angles)
+        return {"status": "success", "driver": driver, "angles": angles}
+
+    def preview_arm_angle(self, driver: str, key: str, angle: int) -> dict[str, object]:
+        if driver != self._arm_driver:
+            raise ValueError(f"driver mismatch: expected {self._arm_driver}, got {driver}")
+        previewer = getattr(self._gripper, "preview_angle", None)
+        if previewer is None:
+            raise ValueError("current gripper does not support angle preview")
+        previewer(key, angle)
+        return {"status": "success", "driver": driver, "key": key, "angle": angle}
+
+    def reinitialize_motor_pair(self) -> dict[str, object]:
+        """重新初始化电机底盘。
+
+        自动重连代理下语义为：断开当前链路并立即完整重连（含 INIT/CONFIG 握手），
+        能自愈"启动时连不上/中途掉线"状态；返回结果并附带底盘连接状态。
+        """
+        reinit = getattr(self._motor_pair, "reinitialize", None)
+        result = bool(reinit()) if reinit is not None else False
+        return {
+            "status": "success",
+            "reinitialize": result,
+            "motor": self.motor_link_status(),
+        }
+
+    def motor_link_status(self) -> dict[str, object]:
+        """底盘连接状态（backend/enabled/connected/state/attempts/error）。"""
+        st = getattr(self._motor_pair, "status", None)
+        if callable(st):
+            return st()
+        # 兜底：旧实现直接持有 TtPidChassis / MockMotorPair（无 status()）
+        backend = self._config.base_driver
+        enabled = backend == "tt_pid"
+        return {
+            "backend": backend,
+            "enabled": enabled,
+            "connected": enabled,  # 旧 TtPidChassis 构造成功即已连接
+            "state": "connected" if enabled else "disabled",
+            "attempts": 0,
+            "error": "",
+        }
 
     def _cancel_pending_stop(self) -> None:
         with self._duration_timer_lock:
@@ -84,28 +167,43 @@ class ControlService:
         with self._duration_timer_lock:
             self._duration_timer = None
 
-    TURN_SPEED_RATIO = 0.3  # 转弯速度比例
-
     def _apply_base_action(self, action: str, speed: int) -> bool:
         if action == "up":
             self._motor_pair.set_speed(speed, speed)
+            get_state_collector().set_target_speed(speed, speed)
         elif action == "down":
             self._motor_pair.set_speed(-speed, -speed)
+            get_state_collector().set_target_speed(-speed, -speed)
         elif action == "left":
-            self._motor_pair.set_speed(-int(speed * self.TURN_SPEED_RATIO), int(speed * self.TURN_SPEED_RATIO))
+            self._motor_pair.set_speed(-speed, speed)
+            get_state_collector().set_target_speed(-speed, speed)
         elif action == "right":
-            self._motor_pair.set_speed(int(speed * self.TURN_SPEED_RATIO), -int(speed * self.TURN_SPEED_RATIO))
+            self._motor_pair.set_speed(speed, -speed)
+            get_state_collector().set_target_speed(speed, -speed)
         elif action == "stop":
             self._motor_pair.brake()
+            get_state_collector().set_target_speed(0, 0)
         else:
             return False
         return True
 
     def _apply_arm_action(self, action: str) -> bool:
+        collector = get_state_collector()
         if action == "grab":
-            self._gripper.close()
+            collector.set_gripper_target(1)
+            collector.set_gripper_status("closed")
+            threading.Thread(target=self._do_grab, daemon=True).start()
         elif action == "release":
-            self._gripper.open()
+            threading.Thread(target=self._do_release, daemon=True).start()
         else:
             return False
         return True
+
+    def _do_grab(self):
+        with self._arm_lock:
+            self._gripper.close()
+        get_state_collector().set_gripper_target(0)
+
+    def _do_release(self):
+        with self._arm_lock:
+            self._gripper.open()

@@ -1,9 +1,11 @@
 import serial
 import time
 
+from src.arm_control.angle_config import load_arm_angles, get_gripper_open, get_gripper_close
+
 
 class STS3215:
-    def __init__(self, port="/dev/ttyS2", baudrate=115200):  # 已修改为115200
+    def __init__(self, port="/dev/ttyS2", baudrate=115200):
         self.ser = serial.Serial(
             port=port,
             baudrate=baudrate,
@@ -11,6 +13,33 @@ class STS3215:
         )
         self.ser.flushInput()
         self.ser.flushOutput()
+        self._angles = load_arm_angles("sts3215")
+
+    def update_angles(self, angles):
+        """合并新角度到运行时配置。"""
+        for group_key in ("grab_position", "lift_position"):
+            if group_key in angles and isinstance(angles[group_key], dict):
+                if group_key not in self._angles or not isinstance(self._angles[group_key], dict):
+                    self._angles[group_key] = {}
+                self._angles[group_key] = {**self._angles[group_key], **angles[group_key]}
+        for scalar_key in ("gripper_open", "gripper_close"):
+            if scalar_key in angles:
+                self._angles[scalar_key] = angles[scalar_key]
+
+    def _pos(self, group_key: str, servo_key: str) -> int:
+        """读取某个位姿组中某个舵机的角度。"""
+        group = self._angles.get(group_key, {})
+        if isinstance(group, dict):
+            return int(group.get(servo_key, 4000))
+        return 4000
+
+    @property
+    def gripper_open_angle(self) -> int:
+        return get_gripper_open(self._angles, "sts3215")
+
+    @property
+    def gripper_close_angle(self) -> int:
+        return get_gripper_close(self._angles, "sts3215")
 
     def checksum(self, data: bytes) -> int:
         return (~sum(data)) & 0xFF
@@ -36,52 +65,37 @@ class STS3215:
         """读取指定地址的数据"""
         params = bytes([addr, length])
         self.send_cmd(servo_id, 0x02, params)  # INST_READ
-        
-        # 等待响应
+
         start_time = time.time()
-        while time.time() - start_time < 1.0:  # 最多等待1秒
-            if self.ser.in_waiting >= 6 + length:  # 响应包的基本长度+数据长度
+        while time.time() - start_time < 1.0:
+            if self.ser.in_waiting >= 6 + length:
                 response = self.ser.read(6 + length)
-                
-                # 验证响应包头
-                if (len(response) >= 6 and 
-                    response[0] == 0xFF and 
-                    response[1] == 0xFF and 
-                    response[2] == servo_id and 
-                    response[4] == 0x00):  # 错误码为0表示成功
-                    
-                    # 提取数据部分
+
+                if (len(response) >= 6 and
+                    response[0] == 0xFF and
+                    response[1] == 0xFF and
+                    response[2] == servo_id and
+                    response[4] == 0x00):
+
                     data_start = 5
                     data_end = data_start + length
                     if data_end <= len(response):
                         return response[data_start:data_end]
                 else:
-                    # 如果不是有效响应，继续读取
                     continue
         return None
 
     def move_to_position(self, servo_id, pos):
-        # 限制范围在 0-4095
         pos = max(0, min(4095, int(pos)))
         data = pos.to_bytes(2, 'little')
-        # 0x2A (42) 是目标位置寄存器
         self.write_reg(servo_id, 0x2A, data)
 
     def get_position(self, servo_id):
-        """
-        获取舵机当前位置
-        :param servo_id: 舵机ID
-        :return: 当前位置值（0-4095），如果读取失败则返回None
-        """
-        # 读取当前位置寄存器（0x38）
         position_data = self.read_data(servo_id, 0x38, 2)
-        
         if position_data is not None and len(position_data) == 2:
-            # 小端序转换
             position = int.from_bytes(position_data, byteorder='little')
             return position
         else:
-            print(f"无法读取舵机 {servo_id} 的位置")
             return None
 
     def move_angle(self, servo_id, angle):
@@ -120,19 +134,9 @@ class STS3215:
         data = int(mode).to_bytes(1, 'little')
         self.write_reg(servo_id, 0x16, data)
 
-servo3_close = 2800
-servo3_open = 4000
-servo3_grab = 3000
-servo1_grab = 1850
-servo1_grab_prepare = 2300
-servo1_release = 2700
-servo1_normal = 3100
-servo2_grab_prepare = 2100
-servo2_grab = 2650
-servo2_normal = 2600
 
 def arm_init(servo):
-    for i in range(1,4):
+    for i in range(1, 4):
         servo.set_operating_mode(i, 0)
         servo.set_speed(i, 1500)
         servo.set_p_coefficient(i, 16)
@@ -144,85 +148,52 @@ def arm_init(servo):
             servo.set_protection_current(i, 250)
             servo.set_overload_torque(i, 25)
 
+
 def grab(servo):
-    servo.move_to_position(3, 4000)
-    time.sleep(0.7)
-    servo.move_to_position(1, 1800)
-    servo.move_to_position(2, 2400)
-    servo.move_to_position(3, 4000)
-    time.sleep(1)
-    servo.move_to_position(3, 3300)
-    time.sleep(1)
-    servo.move_to_position(1, 2600)
-    servo.move_to_position(2, 2500)
-    servo.move_to_position(3, 3300)
-
-def grab1(servo):
-    servo.move_to_position(3, servo3_open)
-    servo.move_to_position(2, servo2_grab_prepare)
-    servo.move_to_position(1, servo1_grab_prepare)
+    """抓取动作：张开夹爪 → 抬起位姿(安全) → 夹取位姿 → 闭合夹爪 → 抬起位姿"""
+    # 1. 张开夹爪 + 抬起位姿作为中间安全位姿
+    servo.move_to_position(3, servo.gripper_open_angle)
+    servo.move_to_position(2, servo._pos("lift_position", "servo2"))
+    servo.move_to_position(1, servo._pos("lift_position", "servo1"))
     time.sleep(0.4)
-    servo.move_to_position(1, servo1_grab)
-    servo.move_to_position(2, servo2_grab)
-    servo.move_to_position(3, servo3_open)
-    time.sleep(1)
-    servo.move_to_position(3, servo3_grab)
-    time.sleep(1)
-    servo.move_to_position(1, servo1_grab_prepare)
-    servo.move_to_position(2, servo2_grab_prepare)
-    servo.move_to_position(3, servo3_grab)
 
-def grab_test(servo):
-    grab1(servo)
-    time.sleep(2)
-    servo.move_to_position(1, 1850)
-    servo.move_to_position(2, 2650)
-    servo.move_to_position(3, 3000)
+    # 2. 夹取位姿（手臂舵机到位，夹爪保持张开）
+    servo.move_to_position(1, servo._pos("grab_position", "servo1"))
+    servo.move_to_position(2, servo._pos("grab_position", "servo2"))
     time.sleep(1)
-    servo.move_to_position(3, 4000)
+
+    # 3. 闭合夹爪
+    servo.move_to_position(3, servo.gripper_close_angle)
+    time.sleep(1)
+
+    # 4. 抬起位姿（手臂舵机抬起，夹爪保持闭合）
+    servo.move_to_position(1, servo._pos("lift_position", "servo1"))
+    servo.move_to_position(2, servo._pos("lift_position", "servo2"))
+
 
 def grab_pos(servo):
-    servo.move_to_position(2, servo2_grab_prepare)
-    servo.move_to_position(1, servo1_normal)
+    servo.move_to_position(2, servo._pos("lift_position", "servo2"))
+    servo.move_to_position(1, servo._pos("lift_position", "servo1"))
     time.sleep(0.4)
-    servo.move_to_position(2, servo2_normal)
-    servo.move_to_position(3, servo3_close)
+    servo.move_to_position(2, servo._pos("lift_position", "servo2"))
+    servo.move_to_position(3, servo._pos("lift_position", "servo3"))
+
 
 def release_pos(servo):
-    servo.move_to_position(1, servo1_normal)
-    servo.move_to_position(2, servo2_grab_prepare)
+    servo.move_to_position(1, servo._pos("lift_position", "servo1"))
+    servo.move_to_position(2, servo._pos("lift_position", "servo2"))
     time.sleep(0.5)
-    servo.move_to_position(2, servo2_normal)
-    servo.move_to_position(3, servo3_grab)
+    servo.move_to_position(2, servo._pos("lift_position", "servo2"))
+    servo.move_to_position(3, servo.gripper_close_angle)
+
 
 def grab_prepare(servo):
-    servo.move_to_position(2, servo2_grab_prepare)
+    servo.move_to_position(2, servo._pos("lift_position", "servo2"))
     time.sleep(0.4)
 
+
 def release(servo):
-    servo.move_to_position(1, servo1_release)
+    """张开夹爪。"""
+    servo.move_to_position(1, servo._pos("lift_position", "servo1"))
     time.sleep(0.5)
-    servo.move_to_position(3, servo3_open)
-
-def main():
-    # 实例化，注意波特率必须与系统设置及电机设置一致
-    servo = STS3215("/dev/ttyACM0", baudrate=115200)
-
-    arm_init(servo)
-
-    # grab(servo)
-
-    # release(servo)
-
-    # 初始位置
-    # servo.move_to_position(1, 2600)
-    # servo.move_to_position(2, 2500)
-    # servo.move_to_position(3, 3000)
-
-    # 夹取位置
-    # servo.move_to_position(1, 1800)
-    # servo.move_to_position(2, 2500)
-    # servo.move_to_position(3, 4000)
-
-if __name__ == '__main__':
-    main()
+    servo.move_to_position(3, servo.gripper_open_angle)

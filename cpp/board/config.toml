@@ -1,0 +1,92 @@
+# AKA-00 机器人部署配置（cpp/ = 配置源）
+# `make -C cpp package` 会把它拷贝进部署目录 cpp/dist/AKA-00/config.toml。
+# 板上运行时实际读取的是 /root/AKA-00/config.toml。
+
+[camera]
+# 采集分辨率：必须用摄像头原生能出帧的档位。
+# 实测本摄像头（Hy-UXGA/B5M2）：320x240 会"假协商不出帧"（勿用！），640x360 可稳定出流。
+# 枚举到的全部档位：1920x1080 1280x960 1280x720 640x360（320x240 为假档）
+width = 640
+height = 360
+fps = 15
+jpeg_quality = 75
+# 浏览器取流方式（CPU ↔ 带宽 的权衡，按机器负载选）：
+#   stream_scale = false（默认，推荐）：**直通原帧** —— 摄像头出的就是压缩好的
+#     MJPEG，直接转发给浏览器，服务端零解码零编码（单核 SoC 上省 ~25ms/帧，
+#     这是"网页看摄像头不卡"的关键）。代价是带宽大：640x360 q75 原帧约
+#     30~60KB/帧（15fps ≈ 4~7Mbps），而缩到 320x180 只要约 15KB/帧。
+#     嫌带宽大就调低 [camera] jpeg_quality（摄像头侧就压小，仍零 CPU），
+#     而不是打开服务端重编码。
+#   stream_scale = true：服务端把采集帧缩到 stream_width x stream_height 并
+#     重编码后下发 —— 省 WiFi 带宽，但每帧多花 ~15ms CPU（解码 10ms 可与屏
+#     显示共享，编码 15ms 省不掉），单核机器上会拖慢取流。
+stream_scale = false
+stream_width = 320
+stream_height = 180
+stream_quality = 75
+# 固定曝光/AWB/增益（默认 false）：廉价 UVC 的自动曝光/AWB 会周期性抖动，
+# 整幅画面每帧一起变 → 屏显示的脏行检测失效（写屏流量上升、帧率下降）。
+# 开启后画面亮度恒定（暗光下会偏暗）；等价于板测工具 tests/demo_camera.c 的 DEMO_EXP_FIX=1。
+exp_fix = false
+
+[motor]
+backend = "tt_pid"
+port = "/dev/ttyS1"
+baudrate = 115200
+ppr = 4680
+
+[arm]
+backend = "zp10s"
+port = "/dev/ttyS2"
+baudrate = 115200
+
+[web]
+port = 80
+https_port = 443
+https_cert = "cert.pem"
+https_key = "key.pem"
+
+[ota]
+check_url = "https://api.chenlongrobot.com/api/user/robot-versions/featured"
+
+[chassis]
+wheel_diameter_mm = 62
+gear_ratio = 90
+
+[logging]
+level = "info"
+
+# ── 板载 SPI 屏实时显示（摄像头画面 → /dev/fb0）──
+# 屏板：ST7796S 320x480 RGB565，SPI 接口。写屏带宽是硬瓶颈：
+#   出厂 4MHz ≈ 420KB/s（约 2fps）→ 设备树 spi-max-frequency 提到 20MHz ≈ 2MB/s
+#   （该板实测 24MHz 起白屏，20MHz 是稳定上限）。
+# 显示线程与浏览器 /api/camera/stream 共享同一份解码结果（Camera::latest_rgb 缓存），
+# 因此开屏不会拖慢浏览器看摄像头的速度/效率；无 /dev/fb0 时自动跳过，不影响服务。
+[display]
+# 屏显示总开关。false = 整个显示栈不启动（无 /dev/fb0 的板子会自动跳过，不用改这里）
+enabled = true
+# 屏跟随摄像头开关 —— **固定行为，不是配置项**（所以这里没有对应的键）：
+#   开机（摄像头关）→ 屏显示熄屏待机图；打开摄像头 → 切实时画面；关闭 → 回到待机图。
+#   屏状态对前端透明，也没有任何 HTTP 接口。
+# 显示区域 = 屏幕 1/scale
+#   1 → 全屏 320x480（默认；307KB/帧，写满时受 SPI 带宽限制约 8fps）
+#   2 → 半屏 160x240 居中（75KB/帧，可吃满摄像头帧率；嫌全屏卡就改回 2）
+# 画面按「旋转 90° + cover 缩放居中裁切」铺满显示区：不拉伸变形，全屏会裁掉约 16% 的上下边
+scale = 1
+# 方向修正：0无 1水平翻 2垂直翻 3=180°（本板实测 3 为正）
+orient = 3
+# 显示帧率上限。全屏一帧 307KB，SPI 实际约 23.44MHz（≈2.4MB/s）→ 写满整屏上限约 8fps；
+# 再高只会让内核里的推送队列积压（画面延迟变大，而不是更流畅）。改回半屏（scale=2）可提到 15
+fps = 8
+# 浏览器有人在看 MJPEG 流时的显示帧率（0 = 暂停显示）。
+# 单核 SoC 上"全屏写屏 + 浏览器取流"会抢 CPU（每帧 RGB565 转换约 28ms + 内核推屏），
+# 有人看流时降到 3 帧（浏览器优先），没人看时恢复 fps
+fps_streaming = 3
+# 解码降采样上限宽。全屏要铺满 320x480，按 640 解码才清晰（按 320 解码会被放大 1.78 倍、
+# 明显发虚）；半屏（scale=2）时用 320 更省 CPU，也能与浏览器共用同一次解码
+decode_max_w = 640
+# 熄屏待机图（摄像头关 / 屏停用时显示的画面，替代纯黑清屏）
+#   路径 —— 相对路径按 $AKA_HOME 解析（打包后在应用根目录）；留空 = 保持黑屏
+#   铺法 —— 总是铺满整屏（不受 scale 影响）；图与面板同比例最好：
+#           start_img.jpg 是 480x320，旋转后正好 1:1，不裁不补
+standby_image = "start_img.jpg"

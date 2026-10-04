@@ -11,33 +11,36 @@
 1. 连接电源，等待控制板指示灯亮起
 2. 等待 60 秒，网络模块启动
 3. 连接机器人热点（格式：`chenlong-robot-xxxxx`）
-4. 浏览器访问 `192.168.4.1`，进入配置 遥控器
+4. 浏览器访问 `192.168.4.1`，进入控制界面
 5. 之后可以通过手机上的遥控器控制小车
 
-如果需要自定义启动流程需要初始化的详细步骤见 [机器人连接](./04-setup/connection.md)
+## 3. 部署（首次/更新）
 
-## 3. 修改代码常用命令
+项目以单文件 `aka-00-server` 分发，拷贝到控制板执行：
 
 ```bash
-# SSH 登录控制板
-# 在同一局域网下用ssh连接
-ssh root@<机器人IP>
+# 打包（在开发机上；改了前端要先 cd frontend && npm run build）
+make -C cpp ota                 # → cpp/dist/aka-00-server
 
-# 通过scp将修改的代码上传到主控上
-scp 本地目录文件 root@<机器人IP>:
+# 拷贝到控制板（-O：板载 sshd 不认新版 SFTP 协议）
+scp -O cpp/dist/aka-00-server root@<robot>:/root/
 
-# 或者在主控上用vim进行修改
-vim 目标文件
-
-# 找到并杀死当前占用线程
-ps ｜ grep python*
-kill -9 pid
-
-# 启动服务
-python run.py
+# 首次部署：解包 + 热点 + 开机自启
+ssh root@<robot> '/root/aka-00-server --init'
 ```
 
-详细部署见 [软件部署](./04-setup/software.md)
+更新部署（**保留** `config.toml`、证书、demo 卡片等现场数据）：
+
+```bash
+scp -O cpp/dist/aka-00-server root@<robot>:/root/
+ssh root@<robot> 'setsid /root/aka-00-server --update >/root/ota.log 2>&1 < /dev/null'
+```
+
+> - **别放 `/tmp`**：板上 `/tmp` 是 53MB 的内存盘，20MB 的固件放那儿会把内存打爆。
+> - 想让本次带的默认配置连 `config.toml` 一起覆盖，用 `AKA_OTA_RESET_CONFIG=1 ... --update`。
+> - `setsid` 是因为 `--update` 结尾是 `exec init.sh`，会把服务挂在当前 ssh 会话上；
+>   也可以升级完直接 `reboot`（开机由 `/etc/init.d/S99webstart` 拉起）。
+
 
 ## 4. 使用
 

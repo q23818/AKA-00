@@ -1,23 +1,11 @@
 """电机硬件接口抽象。"""
 
-from __future__ import annotations
-
 import os
 import sys
 from typing import Protocol, runtime_checkable
 
-from src.state import MotorStateTracker
-
-
-@runtime_checkable
-class MotorProtocol(Protocol):
-    """单电机抽象接口。"""
-
-    def set_speed(self, speed: int) -> None:
-        ...
-
-    def brake(self, val: int = 255) -> None:
-        ...
+from src.base_control.auto_reconnect import AutoReconnectMotorPair
+from src.base_control.tt_pid import TtPidChassis
 
 
 @runtime_checkable
@@ -27,71 +15,75 @@ class MotorPairProtocol(Protocol):
     def set_speed(self, left: int, right: int) -> None:
         ...
 
+    def get_speeds(self) -> tuple[int, int]:
+        """获取左右轮实时 RPM。"""
+        ...
+
     def brake(self) -> None:
         ...
 
     def sleep(self) -> None:
         ...
 
+    def close(self) -> None:
+        ...
 
-class MotorPairAdapter:
-    """N20 双轮适配器。"""
+    def reinitialize(self) -> bool:
+        ...
 
-    def __init__(self, left: MotorProtocol, right: MotorProtocol) -> None:
-        self._left = left
-        self._right = right
-        self._state_tracker = MotorStateTracker.get_instance()
-
-    def set_speed(self, left: int, right: int) -> None:
-        self._state_tracker.update_target(left, right)
-        self._left.set_speed(left)
-        self._right.set_speed(right)
-
-    def brake(self) -> None:
-        self._left.brake()
-        self._right.brake()
-        self._state_tracker.update_target(0, 0)
-
-    def sleep(self) -> None:
-        self._left.set_speed(0)
-        self._right.set_speed(0)
-        self._state_tracker.update_target(0, 0)
+    def get_encoder(self) -> tuple[int, int]:
+        """读取编码器累计脉冲 (M1, M2)。"""
+        ...
 
 
 class MockMotorPair:
     """Mock 双轮底盘，用于 Windows/macOS 开发。"""
 
     def __init__(self) -> None:
-        self._state_tracker = MotorStateTracker.get_instance()
+        self._last_left = 0
+        self._last_right = 0
 
     def set_speed(self, left: int, right: int) -> None:
         print(f"[MockMotorPair] set_speed(left={left}, right={right})")
-        self._state_tracker.update_target(left, right)
+        self._last_left = left
+        self._last_right = right
+
+    def get_speeds(self) -> tuple[int, int]:
+        return self._last_left, self._last_right
 
     def brake(self) -> None:
         print("[MockMotorPair] brake()")
-        self._state_tracker.update_target(0, 0)
+        self._last_left = 0
+        self._last_right = 0
 
     def sleep(self) -> None:
         print("[MockMotorPair] sleep()")
-        self._state_tracker.update_target(0, 0)
+        self._last_left = 0
+        self._last_right = 0
+
+    def close(self) -> None:
+        pass
+
+    def reinitialize(self) -> bool:
+        return True
+
+    def get_encoder(self) -> tuple[int, int]:
+        return 0, 0
 
 
 def create_motor_pair(
-    left_chip: int = 4,
-    left_ch1: int = 0,
-    left_ch2: int = 1,
-    right_chip: int = 4,
-    right_ch1: int = 2,
-    right_ch2: int = 3,
-    chip_type: str = "sg2002",
-) -> MotorPairProtocol:
+    port: str = "/dev/ttyS1",
+    backend: str = "tt_pid",
+) -> MockMotorPair | TtPidChassis | AutoReconnectMotorPair:
+    """创建双轮底盘。backend: tt_pid（ESP32 编码器） 或 mock（开发用）。
+
+    tt_pid 返回自动重连代理：构造永不抛异常（服务必然能起），后台线程按退避
+    策略持续尝试连真底盘，连上即自动切换为真实驱动；期间命令落到 Mock。
+    """
     if os.name == "nt" or sys.platform == "darwin":
         return MockMotorPair()
 
-    from src.base_control.n20 import N20
+    if backend == "tt_pid":
+        return AutoReconnectMotorPair(port=port)
 
-    return MotorPairAdapter(
-        N20(left_chip, left_ch1, left_ch2, chip_type=chip_type),
-        N20(right_chip, right_ch1, right_ch2, chip_type=chip_type),
-    )
+    return MockMotorPair()
